@@ -45,11 +45,13 @@ Original project:
 
 1. Open the repository Releases page
 2. Download the latest `dockbridge.js` release asset
-3. Copy it into your Spicetify extensions folder:
+3. Copy it into your Spicetify extensions folder by running:
 
 ```powershell
-Copy-Item .\dockbridge.js "$env:APPDATA\spicetify\Extensions\dockbridge.js" -Force
+spicetify config-dir
 ```
+and then opening the folder 
+`extensions`
 
 4. Add it to your Spicetify extensions list:
 
