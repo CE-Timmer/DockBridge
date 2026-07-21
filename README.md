@@ -34,7 +34,7 @@ Behavior:
 
 ### 1. Optional: install original Spicy Lyrics
 
-Install the original extension only if you want its UI inside Spotify (page/buttons/renderer), for example through Spicetify Marketplace or your existing `spicy-lyrics.mjs` setup.
+Install the original extension only if you want its UI inside Spotify (page/buttons/renderer), for example through Spicetify Marketplace or `spicy-lyrics.mjs` setup.
 
 Original project:
 - https://github.com/Spikerko/spicy-lyrics
