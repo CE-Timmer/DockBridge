@@ -1,6 +1,6 @@
 # DockBridge
 
-### This extension is made trough editing the Spotify extension `spicy-lyrics` by spikerko.
+### This extension is made trough editing the Spicetify extension `spicy-lyrics` by spikerko.
 
 ### full credits to spikerko for allowing me to do this
 
