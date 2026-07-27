@@ -1,10 +1,10 @@
 # DockBridge
 
-`DockBridge` is a standalone Spicetify extension package built to feed rich playback and lyric data into `SpotifyDock`.
-
 ### This extension is made trough editing the Spotify extension `spicy-lyrics` by spikerko.
 
 ### full credits to spikerko for allowing me to do this
+
+`DockBridge` is a standalone Spicetify extension package built to feed rich playback and lyric data into `SpotifyDock`.
 
 It keeps the Spicy Lyrics core pipeline available for lyric state, timing, and metadata capture, but removes the user-openable UI lifecycle so it can run quietly beside the original Spicy Lyrics extension.
 
