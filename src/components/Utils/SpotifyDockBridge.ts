@@ -17,10 +17,10 @@ let lastPayloadHash = "";
 let pending = false;
 let pendingSinceMs = 0;
 let lastPositionMs = 0;
-let lastPositionEventAtMs = 0;
+let lastPositionAdvanceAtMs = 0;
+let lastHelperPositionSample: { trackId: string; positionMs: number; changedAtMs: number } | null = null;
 let lastEmitAtMs = 0;
 let streamSequence = 0;
-let lastStablePlayback: { trackId: string; progressMs: number; isPlaying: boolean; sentAtMs: number } | null = null;
 let latestSongEventTrack: {
   trackId: string;
   title: string;
@@ -183,39 +183,10 @@ function stabilizePlaybackPacket(packet: {
   isPlaying: boolean;
   sentAtMs: number;
 }) {
-  const current = {
+  return {
     ...packet,
     progressMs: Math.max(0, Math.min(packet.durationMs || Number.MAX_SAFE_INTEGER, packet.progressMs))
   };
-
-  const prev = lastStablePlayback;
-  if (!prev || prev.trackId !== current.trackId) {
-    lastStablePlayback = {
-      trackId: current.trackId,
-      progressMs: current.progressMs,
-      isPlaying: current.isPlaying,
-      sentAtMs: current.sentAtMs
-    };
-    return current;
-  }
-
-  const delta = current.progressMs - prev.progressMs;
-  const playStateChanged = prev.isPlaying !== current.isPlaying;
-  const bigSeekJump = Math.abs(delta) >= 900;
-
-  // Only guard paused tiny regressions. While playing, allow backward jumps
-  // so user seek/skip corrections are reflected immediately.
-  if (!playStateChanged && !bigSeekJump && !current.isPlaying && delta < -120) {
-    current.progressMs = prev.progressMs;
-  }
-
-  lastStablePlayback = {
-    trackId: current.trackId,
-    progressMs: current.progressMs,
-    isPlaying: current.isPlaying,
-    sentAtMs: current.sentAtMs
-  };
-  return current;
 }
 
 function isActuallyPlaying(): boolean {
@@ -233,14 +204,25 @@ function isActuallyPlaying(): boolean {
 
 function getLiveProgressMs(): number {
   const now = Date.now();
-  const recentPositionEvent = lastPositionEventAtMs > 0 && now - lastPositionEventAtMs <= 1800;
-  if (recentPositionEvent) {
-    const playing = isActuallyPlaying();
-    if (!playing) return Math.max(0, lastPositionMs);
-    return Math.max(0, lastPositionMs + (now - lastPositionEventAtMs));
+  const playing = isActuallyPlaying();
+  const trackId = String(SpotifyPlayer.GetId() ?? "");
+  const helperPos = Math.max(0, Number(SpotifyPlayer.GetPosition() ?? 0));
+  if (
+    !lastHelperPositionSample ||
+    lastHelperPositionSample.trackId !== trackId ||
+    Math.abs(helperPos - lastHelperPositionSample.positionMs) > 8
+  ) {
+    lastHelperPositionSample = { trackId, positionMs: helperPos, changedAtMs: now };
+  }
+  const helperIsFresh = helperPos > 500 && now - lastHelperPositionSample.changedAtMs <= 750;
+  // Spotify can emit duplicate position events. Use the last event that
+  // actually advanced and extrapolate from it; never reset the timestamp on a
+  // duplicate value.
+  const recentPositionAdvance = lastPositionAdvanceAtMs > 0 && now - lastPositionAdvanceAtMs <= 1800;
+  if (recentPositionAdvance) {
+    return Math.max(0, lastPositionMs + (playing ? now - lastPositionAdvanceAtMs : 0));
   }
 
-  const helperPos = Math.max(0, Number(SpotifyPlayer.GetPosition() ?? 0));
   try {
     const state = (Spicetify as any)?.Platform?.PlayerAPI?._state;
     if (state && Number.isFinite(state.positionAsOfTimestamp) && Number.isFinite(state.timestamp)) {
@@ -248,15 +230,9 @@ function getLiveProgressMs(): number {
       const base = Number(state.positionAsOfTimestamp);
       const statePos = paused ? Math.max(0, base) : Math.max(0, base + Math.max(0, Date.now() - Number(state.timestamp)));
       const stateAgeMs = Math.max(0, Date.now() - Number(state.timestamp));
-      const helperLooksValid = helperPos > 500;
-      const stateLooksStale = !paused && stateAgeMs > 5000;
       const largeSourceMismatch = Math.abs(statePos - helperPos) > 2000;
 
-      // Only trust helper source when it looks valid; avoid snapping to zero/stale helper values.
-      if (helperLooksValid && (stateLooksStale || largeSourceMismatch)) {
-        return helperPos;
-      }
-      return statePos;
+      return helperIsFresh && (stateAgeMs > 5000 || largeSourceMismatch) ? helperPos : statePos;
     }
   } catch {
     // ignore and fallback
@@ -779,24 +755,24 @@ export function setupSpotifyDockBridge() {
       void refreshLyricsForCurrentTrack(trackId, true);
     }
     lastPayloadHash = "";
-    lastStablePlayback = null;
     lastPositionMs = 0;
-    lastPositionEventAtMs = 0;
+    lastPositionAdvanceAtMs = 0;
+    lastHelperPositionSample = null;
     onTick();
   });
   Global.Event.listen("playback:position", (pos) => {
     const p = Number(pos);
     if (!Number.isFinite(p)) return;
     const now = Date.now();
-    const jumped = Math.abs(p - lastPositionMs) > 1400;
+    const advanced = Math.abs(p - lastPositionMs) > 8;
+    const jumped = lastPositionMs > 0 && Math.abs(p - lastPositionMs) > 1400;
     lastPositionMs = p;
-    lastPositionEventAtMs = now;
+    if (advanced) lastPositionAdvanceAtMs = now;
     const heartbeatDue = now - lastEmitAtMs > STREAM_HEARTBEAT_MS;
     // Keep a steady playback stream for anchors, plus immediate seek jump updates.
     if (jumped || heartbeatDue) onTick();
   });
   Global.Event.listen("playback:playpause", () => {
-    lastStablePlayback = null;
     onTick();
   });
 

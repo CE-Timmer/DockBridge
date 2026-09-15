@@ -55,6 +55,8 @@ export async function Query(
       headers: {
         "Content-Type": "application/json",
         "SpicyLyrics-Version": clientVersion?.Text ?? "",
+        // Required by the current Spicy Lyrics API contract.
+        "X-mode": "2",
         ...headers,
       },
       body: JSON.stringify({

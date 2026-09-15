@@ -10,11 +10,28 @@ import { SetWaitingForHeight } from "../Scrolling/ScrollToActiveLine.ts";
 import storage from "../storage.ts";
 import { APP_CACHE_PREFIX } from "../runtimeNamespace.ts";
 import { ProcessLyrics } from "./ProcessLyrics.ts";
+import { SLObjPack } from "../objpack.ts";
 
 export const LyricsStore = GetExpireStore<any>(`${APP_CACHE_PREFIX}_LyricsStore`, 12, {
   Unit: "Days",
   Duration: 3,
 }, isDev as true);
+
+const lyricsPacker = new SLObjPack();
+
+function unpackLyricsPayload(payload: unknown): any {
+  // The current Spicy Lyrics API object-packs lyric payloads. Keep accepting
+  // the former object response so cached/dev deployments remain compatible.
+  if (
+    Array.isArray(payload) &&
+    payload.length === 2 &&
+    Array.isArray(payload[0]) &&
+    Array.isArray(payload[1])
+  ) {
+    return lyricsPacker.unpack(payload);
+  }
+  return payload;
+}
 
 export default async function fetchLyrics(uri: string): Promise<[object | string, number] | null> {
   const IsSpicyRenderer = Defaults.LyricsRenderer === "Spicy";
@@ -161,27 +178,39 @@ export default async function fetchLyrics(uri: string): Promise<[object | string
     const lyricsAccessToken = storage.get("lyricsApiAccessToken") ?? Defaults.LyricsContent.api.accessToken; */
 
   try {
-    const Token = await Platform.GetSpotifyAccessToken();
-
-    let lyricsText = "";
     let status = 0;
 
-    const queries = await Query(
-      [
-        {
-          operation: "lyrics",
-          variables: {
-            id: trackId,
-            auth: "SpicyLyrics-WebAuth",
+    const runLyricsQuery = async (token: string) => {
+      const queries = await Query(
+        [
+          {
+            operation: "lyrics",
+            variables: {
+              id: trackId,
+              auth: "SpicyLyrics-WebAuth",
+            },
           },
-        },
-      ],
-      {
-        "SpicyLyrics-WebAuth": `Bearer ${Token}`,
-      }
-    );
+        ],
+        {
+          "SpicyLyrics-WebAuth": `Bearer ${token}`,
+        }
+      );
+      return queries.get("0");
+    };
 
-    const lyricsQuery = queries.get("0");
+    const token = await Platform.GetSpotifyAccessToken();
+    let lyricsQuery = await runLyricsQuery(token);
+
+    // Spotify occasionally rotates a token before its advertised expiry. The
+    // current Spicy Lyrics client retires a refused token and retries once.
+    if (lyricsQuery?.httpStatus === 401) {
+      Platform.InvalidateSpotifyAccessToken(token);
+      const refreshedToken = await Platform.GetSpotifyAccessToken();
+      if (refreshedToken && refreshedToken !== token) {
+        lyricsQuery = await runLyricsQuery(refreshedToken);
+      }
+    }
+
     if (!lyricsQuery) {
       console.error("[Spicy Lyrics] Lyrics query not found");
       HideLoaderContainer();
@@ -190,12 +219,6 @@ export default async function fetchLyrics(uri: string): Promise<[object | string
     }
 
     status = lyricsQuery.httpStatus;
-
-    if (lyricsQuery.format !== "json") {
-      lyricsText = "";
-    }
-
-    lyricsText = JSON.stringify(lyricsQuery.data);
 
     if (status !== 200) {
       if (status === 404) {
@@ -208,19 +231,12 @@ export default async function fetchLyrics(uri: string): Promise<[object | string
       return ["status-not-200", status];
     }
 
-    if (lyricsText === null) {
+    const lyrics = unpackLyricsPayload(lyricsQuery.data);
+    if (lyrics === null || lyrics === undefined || lyrics === "") {
       HideLoaderContainer();
       storage.set("currentlyFetching", "false");
       return ["lyrics-not-found", 404];
     }
-    if (lyricsText === "") {
-      HideLoaderContainer();
-      storage.set("currentlyFetching", "false");
-      return ["lyrics-not-found", 404];
-    }
-
-    // const providerLyrics = JSON.parse(lyricsText);
-    const lyrics = JSON.parse(lyricsText);
 
     IsSpicyRenderer ? await ProcessLyrics(lyrics) : null;
 
