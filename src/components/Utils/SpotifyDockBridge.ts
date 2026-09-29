@@ -1,7 +1,7 @@
 import Global from "../Global/Global.ts";
 import { SpotifyPlayer } from "../Global/SpotifyPlayer.ts";
 import storage from "../../utils/storage.ts";
-import fetchLyrics from "../../utils/Lyrics/fetchLyrics.ts";
+import fetchLyrics, { LyricsStore } from "../../utils/Lyrics/fetchLyrics.ts";
 import ApplyLyrics from "../../utils/Lyrics/Global/Applyer.ts";
 
 const BRIDGE_URL = "http://127.0.0.1:61337/v1/current-track";
@@ -10,7 +10,8 @@ const STREAM_HEARTBEAT_MS = 320;
 const AGGRESSIVE_HEARTBEAT_MS = 180;
 const KEEPALIVE_PULSE_MS = 900;
 const PROGRESS_BUCKET_MS = 250;
-const LYRICS_REFRESH_COOLDOWN_MS = 450;
+const LYRICS_REFRESH_COOLDOWN_MS = 1500;
+const LYRICS_CACHE_RESET_VERSION = "2026-09-15-fresh-syllables";
 
 let started = false;
 let lastPayloadHash = "";
@@ -29,6 +30,20 @@ let latestSongEventTrack: {
   durationMs: number;
 } | null = null;
 const lastLyricsRefreshAtByTrack = new Map<string, number>();
+const cachedLyricsByTrack = new Map<string, SpicyLine[]>();
+const pendingLyricsRefreshes = new Map<string, Promise<void>>();
+
+async function clearSpicyLyricsCacheOnce() {
+  const resetKey = "dockbridge:lyrics-cache-reset-version";
+  try {
+    if (localStorage.getItem(resetKey) === LYRICS_CACHE_RESET_VERSION) return;
+    await LyricsStore.Destroy();
+    storage.set("currentLyricsData", null);
+    localStorage.setItem(resetKey, LYRICS_CACHE_RESET_VERSION);
+  } catch {
+    // A fresh bridge fetch still bypasses stale cache entries if this is unavailable.
+  }
+}
 
 type SpicyLine = {
   time: number;
@@ -428,6 +443,57 @@ function hexToRgbString(hex: string): string | null {
   return `${r},${g},${b}`;
 }
 
+type TimedBridgeWord = { text: string; startTime: number; endTime?: number };
+
+// Recent Spicy Lyrics responses can mark the document as `Line` while still
+// carrying word/syllable timing in a nested field.  Keep this traversal
+// deliberately permissive so a provider-side wrapper rename does not turn a
+// syllable-timed song into a line-only DockBridge payload.
+function extractTimedWords(entry: any): TimedBridgeWord[] {
+  const candidates = [
+    entry?.Syllables,
+    entry?.Syllables?.Lead,
+    entry?.Words,
+    entry?.Lead?.Syllables,
+    entry?.Lead?.Words,
+    entry?.Content?.Syllables,
+    entry?.Content?.Words,
+    entry?.Timing?.Syllables,
+    entry?.Timing?.Words
+  ];
+
+  for (const candidate of candidates) {
+    const units = Array.isArray(candidate)
+      ? candidate
+      : Array.isArray(candidate?.Items)
+        ? candidate.Items
+        : Array.isArray(candidate?.Content)
+          ? candidate.Content
+          : null;
+    if (!units?.length) continue;
+
+    const words = units
+      .map((unit: any, index: number) => {
+        const text = String(unit?.Text ?? unit?.text ?? unit?.Word ?? unit?.word ?? "");
+        const rawStart = unit?.StartTime ?? unit?.startTime ?? unit?.Start ?? unit?.start;
+        const rawEnd = unit?.EndTime ?? unit?.endTime ?? unit?.End ?? unit?.end;
+        if (!text || !Number.isFinite(Number(rawStart))) return null;
+        // Spicy's syllables omit spaces for IsPartOfWord fragments. Preserve
+        // that convention in the display text while keeping the original time.
+        const joinsPrevious = Boolean(unit?.IsPartOfWord ?? unit?.isPartOfWord);
+        const needsSpace = index > 0 && !joinsPrevious && !/^\s/.test(text);
+        return {
+          text: needsSpace ? ` ${text}` : text,
+          startTime: normalizeTime(rawStart),
+          endTime: Number.isFinite(Number(rawEnd)) ? normalizeTime(rawEnd) : undefined
+        } satisfies TimedBridgeWord;
+      })
+      .filter(Boolean) as TimedBridgeWord[];
+    if (words.length) return words;
+  }
+  return [];
+}
+
 function normalizeLyricsFromStorage(trackId: string): SpicyLine[] {
   const raw = storage.get("currentLyricsData");
   if (!raw) return [];
@@ -472,14 +538,16 @@ function normalizeLyricsFromStorage(trackId: string): SpicyLine[] {
       .filter((line: any) => line?.Type === "Vocal")
       .map((line: any, index: number) => {
         const time = normalizeTime(line.StartTime);
+        const words = extractTimedWords(line);
         const secondaryFromSelf = extractSecondaryText(line);
         const secondaryFromNearby = findNearbyBackgroundText(content, time, index);
         return {
           time,
           duration: Math.max(0.05, normalizeTime(line.EndTime) - normalizeTime(line.StartTime)),
-          text: String(line.Text ?? "").trim(),
+          text: (words.length ? words.map((word) => word.text).join("") : String(line.Text ?? "")).trim(),
           secondaryText: (secondaryFromSelf || secondaryFromNearby || "").trim() || undefined,
-          side: resolveSide(line, "left")
+          side: resolveSide(line, "left"),
+          words: words.length ? words : undefined
         };
       })
       .filter((line: SpicyLine) => line.text.length > 0);
@@ -626,6 +694,9 @@ function payloadHash(payload: any): string {
 }
 
 async function refreshLyricsForCurrentTrack(trackId: string, force = false) {
+  const existingRefresh = pendingLyricsRefreshes.get(trackId);
+  if (existingRefresh) return existingRefresh;
+
   const now = Date.now();
   const lastRefreshAt = lastLyricsRefreshAtByTrack.get(trackId) ?? 0;
   if (!force && now - lastRefreshAt < LYRICS_REFRESH_COOLDOWN_MS) return;
@@ -636,13 +707,21 @@ async function refreshLyricsForCurrentTrack(trackId: string, force = false) {
     (trackId ? `spotify:track:${trackId}` : "");
   if (!uri) return;
 
-  try {
-    const fetched = await fetchLyrics(String(uri));
-    await ApplyLyrics(fetched);
-    scheduleBridgeColorRefresh();
-  } catch {
-    // best effort; next heartbeat can retry
-  }
+  const refresh = (async () => {
+    try {
+      // A track-change refresh must not reuse Spicy's three-day lyric cache:
+      // providers can upgrade a line-timed lyric to a syllable-timed one.
+      const fetched = await fetchLyrics(String(uri), { bypassCache: force });
+      await ApplyLyrics(fetched);
+      scheduleBridgeColorRefresh();
+    } catch {
+      // Best effort; the next scheduled retry can recover a transient API failure.
+    } finally {
+      pendingLyricsRefreshes.delete(trackId);
+    }
+  })();
+  pendingLyricsRefreshes.set(trackId, refresh);
+  return refresh;
 }
 
 function scheduleBridgeColorRefresh() {
@@ -681,6 +760,7 @@ async function flushBridge() {
           if (sameNoLyricsTrack) {
             noLyrics = true;
             lyrics = [];
+            cachedLyricsByTrack.delete(track.trackId);
           }
         } else {
           const parsed = JSON.parse(rawText);
@@ -697,6 +777,14 @@ async function flushBridge() {
       } catch {
         // ignore malformed lyrics cache
       }
+    }
+    // fetchLyrics briefly clears/replaces its shared cache while a same-track
+    // refresh is underway.  Keep the last complete payload for that track so
+    // the dock does not randomly lose lyrics between two successful fetches.
+    if (lyrics.length) {
+      cachedLyricsByTrack.set(track.trackId, lyrics);
+    } else if (!noLyrics) {
+      lyrics = cachedLyricsByTrack.get(track.trackId) ?? [];
     }
     if (!lyrics.length && !noLyrics) {
       void refreshLyricsForCurrentTrack(track.trackId);
@@ -789,5 +877,11 @@ export function setupSpotifyDockBridge() {
   document.addEventListener("visibilitychange", onTick);
   window.addEventListener("focus", onTick);
 
-  onTick();
+  // Clear the old Spicy lyric cache once, then immediately fetch the track
+  // currently playing. Spotify does not always emit songchange on reload.
+  void clearSpicyLyricsCacheOnce().finally(() => {
+    const initialTrack = getTrackPayload()?.trackId;
+    if (initialTrack) void refreshLyricsForCurrentTrack(initialTrack, true);
+    onTick();
+  });
 }

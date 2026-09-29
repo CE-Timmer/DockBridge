@@ -33,7 +33,11 @@ function unpackLyricsPayload(payload: unknown): any {
   return payload;
 }
 
-export default async function fetchLyrics(uri: string): Promise<[object | string, number] | null> {
+export default async function fetchLyrics(
+  uri: string,
+  options: { bypassCache?: boolean } = {}
+): Promise<[object | string, number] | null> {
+  const bypassCache = options.bypassCache === true;
   const IsSpicyRenderer = Defaults.LyricsRenderer === "Spicy";
 
   //if (!PageContainer) return;
@@ -96,7 +100,7 @@ export default async function fetchLyrics(uri: string): Promise<[object | string
   // Check if there's already data in localStorage
   const savedLyricsData = storage.get("currentLyricsData")?.toString();
 
-  if (savedLyricsData && !isDev) {
+  if (savedLyricsData && !isDev && !bypassCache) {
     try {
       if (savedLyricsData.includes("NO_LYRICS")) {
         const split = savedLyricsData.split(":");
@@ -132,7 +136,7 @@ export default async function fetchLyrics(uri: string): Promise<[object | string
     }
   }
 
-  if (LyricsStore) {
+  if (LyricsStore && !bypassCache) {
     try {
       const lyricsFromCacheRes = await LyricsStore.GetItem(trackId);
       if (lyricsFromCacheRes) {
